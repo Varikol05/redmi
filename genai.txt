@@ -8,7 +8,7 @@ from langchain_community.chat_models import AzureChatOpenAI
 from langchain.schema import HumanMessage
 import azure.functions as func
 
-logger = logging.getLogger("azure_function")
+logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 def unpad(data):
@@ -53,8 +53,8 @@ def get_instruction_and_prompt(input_type, custom_prompt=None):
             "You are an expert in analysing the RAML and generating the payload from the RAML. "
             "I am providing the RAML which will be used as an asset for designing my API. "
             "Please analyze the RAML and generate the sample payload which will honor all the rules inside the RAML. "
-            "You can refer the link for any doubts related to RAML: https://raml.org/developers/raml-100-tutorial."
-            "\n\n**IMPORTANT**: Only return a valid JSON object or JSON array containing the payload. "
+            "You can refer the link for any doubts related to RAML: https://raml.org/developers/raml-100-tutorial.\n\n"
+            "**IMPORTANT**: Only return a valid JSON object or JSON array containing the payload. "
             "Do NOT include any markdown, explanations, or extra text. The response must be parseable as JSON."
         )
         default_prompt = "Please generate one JSON payload from the following RAML:"
@@ -113,25 +113,36 @@ def extract_json_from_response(text):
 
     return None
 
-def main(req: func.HttpRequest, context: func.Context) -> func.HttpResponse:
+def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        logger.info("Received request.")
+        logger.info("Processing request...")
 
-        if not req.get_body():
+        raw_body = req.get_body()
+
+        # Decode from base64
+        try:
+            decoded_bytes = b64decode(raw_body)
+        except Exception:
             return func.HttpResponse(
-                json.dumps({"error": "File content is missing."}),
+                json.dumps({"error": "Request body is not valid base64."}),
                 status_code=400
             )
 
-        if not req.headers.get('Content-Type', '').startswith('application/octet-stream'):
-            return func.HttpResponse(
-                json.dumps({"error": "Expected base64-encoded content in application/octet-stream."}),
-                status_code=400
-            )
+        # Try decoding as UTF-8 or UTF-16
+        try:
+            file_content = decoded_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            try:
+                file_content = decoded_bytes.decode('utf-16')
+            except UnicodeDecodeError:
+                return func.HttpResponse(
+                    json.dumps({"error": "Uploaded file is not a valid UTF-8 or UTF-16 encoded text file."}),
+                    status_code=400
+                )
 
-        file_content = b64decode(req.get_body()).decode('utf-8')
-        input_value = req.params.get('input')
-        custom_prompt = req.params.get('prompt')
+        query_params = req.params
+        input_value = query_params.get('input')
+        custom_prompt = query_params.get('prompt')
 
         if not input_value:
             return func.HttpResponse(
@@ -139,14 +150,15 @@ def main(req: func.HttpRequest, context: func.Context) -> func.HttpResponse:
                 status_code=400
             )
 
-        model_instance_name = req.headers.get('model_instance_name')
+        headers = req.headers
+        model_instance_name = headers.get('model_instance_name')
         if not model_instance_name:
             return func.HttpResponse(
                 json.dumps({"error": "'model_instance_name' header is missing."}),
                 status_code=400
             )
 
-        count = int(req.headers.get('count', '1'))
+        count = int(headers.get('count', '1'))
 
         file_type = detect_file_type(file_content)
         logger.info(f"Detected file type: {file_type}")
@@ -201,5 +213,3 @@ def main(req: func.HttpRequest, context: func.Context) -> func.HttpResponse:
             json.dumps({"error": str(e)}),
             status_code=500
         )
-
-{"error": "'utf-8' codec can't decode byte 0xc6 in position 0: invalid continuation byte"}
