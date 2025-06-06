@@ -6,8 +6,9 @@ from base64 import b64decode
 from Crypto.Cipher import AES
 from langchain_community.chat_models import AzureChatOpenAI
 from langchain.schema import HumanMessage
+import azure.functions as func
 
-logger = logging.getLogger()
+logger = logging.getLogger("azure_function")
 logger.setLevel(logging.INFO)
 
 def unpad(data):
@@ -112,50 +113,54 @@ def extract_json_from_response(text):
 
     return None
 
-def lambda_handler(event, context):
+def main(req: func.HttpRequest, context: func.Context) -> func.HttpResponse:
     try:
-        logger.info("Received event: %s", json.dumps(event)[:1000])
+        logger.info("Received request.")
 
-        if 'body' not in event or 'isBase64Encoded' not in event or not event['isBase64Encoded']:
-            return {
-                "statusCode": 400,
-                "body": json.dumps({"error": "File content is missing or not base64-encoded."})
-            }
+        if not req.get_body():
+            return func.HttpResponse(
+                json.dumps({"error": "File content is missing."}),
+                status_code=400
+            )
 
-        file_content = b64decode(event['body']).decode('utf-8')
-        query_params = event.get('queryStringParameters', {})
-        input_value = query_params.get('input')
-        custom_prompt = query_params.get('prompt')
+        if not req.headers.get('Content-Type', '').startswith('application/octet-stream'):
+            return func.HttpResponse(
+                json.dumps({"error": "Expected base64-encoded content in application/octet-stream."}),
+                status_code=400
+            )
+
+        file_content = b64decode(req.get_body()).decode('utf-8')
+        input_value = req.params.get('input')
+        custom_prompt = req.params.get('prompt')
 
         if not input_value:
-            return {
-                "statusCode": 400,
-                "body": json.dumps({"error": "'input' parameter is missing in query string."})
-            }
+            return func.HttpResponse(
+                json.dumps({"error": "'input' parameter is missing in query string."}),
+                status_code=400
+            )
 
-        headers = event.get('headers', {})
-        model_instance_name = headers.get('model_instance_name')
+        model_instance_name = req.headers.get('model_instance_name')
         if not model_instance_name:
-            return {
-                "statusCode": 400,
-                "body": json.dumps({"error": "'model_instance_name' header is missing."})
-            }
+            return func.HttpResponse(
+                json.dumps({"error": "'model_instance_name' header is missing."}),
+                status_code=400
+            )
 
-        count = int(headers.get('count', '1'))
+        count = int(req.headers.get('count', '1'))
 
         file_type = detect_file_type(file_content)
         logger.info(f"Detected file type: {file_type}")
 
         if input_value == "/sampleforraml" and file_type != "raml":
-            return {
-                "statusCode": 400,
-                "body": json.dumps({"error": "Only RAML or RAML-like .txt content is allowed for /sampleforraml."})
-            }
+            return func.HttpResponse(
+                json.dumps({"error": "Only RAML or RAML-like .txt content is allowed for /sampleforraml."}),
+                status_code=400
+            )
         elif input_value == "/sampleforxsd" and file_type != "xsd":
-            return {
-                "statusCode": 400,
-                "body": json.dumps({"error": "Only XSD or XSD-like .txt content is allowed for /sampleforxsd."})
-            }
+            return func.HttpResponse(
+                json.dumps({"error": "Only XSD or XSD-like .txt content is allowed for /sampleforxsd."}),
+                status_code=400
+            )
 
         prompt_data = get_instruction_and_prompt(input_value, custom_prompt)
         client = get_openai_client(model_instance_name)
@@ -178,21 +183,21 @@ def lambda_handler(event, context):
                 results.append(response.content.strip())
 
         if input_value == "/sampleforraml":
-            return {
-                "statusCode": 200,
-                "headers": {"Content-Type": prompt_data["content_type"]},
-                "body": json.dumps(results, indent=2)
-            }
+            return func.HttpResponse(
+                json.dumps(results, indent=2),
+                status_code=200,
+                mimetype=prompt_data["content_type"]
+            )
         else:
-            return {
-                "statusCode": 200,
-                "headers": {"Content-Type": prompt_data["content_type"]},
-                "body": "\n\n".join(results)
-            }
+            return func.HttpResponse(
+                "\n\n".join(results),
+                status_code=200,
+                mimetype=prompt_data["content_type"]
+            )
 
     except Exception as e:
         logger.error("Unhandled exception: %s", str(e))
-        return {
-            "statusCode": 500,
-            "body": json.dumps({"error": str(e)})
-        }
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500
+        )
