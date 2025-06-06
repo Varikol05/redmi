@@ -2,7 +2,7 @@ import os
 import logging
 import json
 import re
-from base64 import b64decode
+from base64 import b64decode, b64encode
 from Crypto.Cipher import AES
 from langchain_community.chat_models import AzureChatOpenAI
 from langchain.schema import HumanMessage
@@ -15,16 +15,31 @@ def unpad(data):
     return data[:-padding_length]
 
 def decrypt(data, key):
-    cipher = AES.new(b64decode(key), AES.MODE_ECB)
-    decrypted_data = cipher.decrypt(b64decode(data))
-    decrypted_data = unpad(decrypted_data)
-    return decrypted_data.decode()
+    try:
+        cipher = AES.new(b64decode(key), AES.MODE_ECB)
+        decrypted_data = cipher.decrypt(b64decode(data))
+        decrypted_data = unpad(decrypted_data)
+        return decrypted_data.decode()
+    except Exception as e:
+        logger.error(f"Decryption failed: {e}")
+        raise
+
+def safe_decode(b):
+    try:
+        return b.decode('utf-8')
+    except UnicodeDecodeError as e:
+        logger.warning(f"UTF-8 decode error: {e}, trying latin1 decode")
+        return b.decode('latin1')
 
 def get_openai_client(model_instance_name):
-    aes_key_base64 = os.environ['AES_KEY']
-    encrypted_api_base = os.environ['ENCRYPTED_API_BASE']
-    encrypted_api_key = os.environ['ENCRYPTED_API_KEY']
-    api_version = os.environ['AZURE_API_VERSION']
+    try:
+        aes_key_base64 = os.environ['AES_KEY']
+        encrypted_api_base = os.environ['ENCRYPTED_API_BASE']
+        encrypted_api_key = os.environ['ENCRYPTED_API_KEY']
+        api_version = os.environ['AZURE_API_VERSION']
+    except KeyError as e:
+        logger.error(f"Missing environment variable: {e}")
+        raise
 
     decrypted_api_base = decrypt(encrypted_api_base, aes_key_base64)
     decrypted_api_key = decrypt(encrypted_api_key, aes_key_base64)
@@ -32,31 +47,18 @@ def get_openai_client(model_instance_name):
     if not decrypted_api_base.endswith('/'):
         decrypted_api_base += '/'
 
-    return AzureChatOpenAI(
+    client = AzureChatOpenAI(
         deployment_name=model_instance_name,
         openai_api_base=decrypted_api_base,
         openai_api_key=decrypted_api_key,
         openai_api_version=api_version
     )
-
-def safe_decode(b):
-    try:
-        return b.decode('utf-8-sig')  # Handles BOM and utf-8
-    except UnicodeDecodeError:
-        return b.decode('ISO-8859-1')
+    return client
 
 def detect_file_type(file_content):
-    normalized = file_content.strip().lower()
-
-    # Remove XML declaration if present
-    if normalized.startswith('<?xml'):
-        lines = normalized.splitlines()
-        if len(lines) > 1:
-            normalized = "\n".join(lines[1:]).strip()
-
-    if normalized.startswith("#%raml") or "%raml" in normalized:
+    if re.search(r'^(%RAML)|(^#%RAML)', file_content.strip(), re.IGNORECASE):
         return "raml"
-    elif normalized.startswith("<xs:schema") or "http://www.w3.org/2001/XMLSchema" in normalized:
+    elif "<xs:schema" in file_content or "http://www.w3.org/2001/XMLSchema" in file_content:
         return "xsd"
     return "unknown"
 
@@ -126,36 +128,48 @@ def extract_json_from_response(text):
 
     return None
 
-def main(req):  # Azure Function entrypoint
+def main(req):
     try:
-        event = {}
-        event['body'] = req.get_body()
-        event['isBase64Encoded'] = True
-        event['queryStringParameters'] = req.params
-        event['headers'] = req.headers
+        logger.info("Function triggered.")
 
-        logger.info("Received request")
-
-        if 'body' not in event or not event['body']:
+        # Get raw bytes from request body
+        file_bytes = req.get_body()
+        if not file_bytes:
+            logger.error("No file content found in request body.")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"error": "File content is missing."})
             }
 
-        file_bytes = event['body']
-        file_content = safe_decode(file_bytes)
+        logger.info(f"Received {len(file_bytes)} bytes in body.")
 
-        query_params = event.get('queryStringParameters', {})
+        # Decode base64 from body
+        try:
+            file_content = b64decode(file_bytes).decode('utf-8')
+            logger.info(f"File content decoded as UTF-8, length: {len(file_content)}")
+        except Exception as e:
+            logger.warning(f"Failed to decode as UTF-8, trying latin1: {e}")
+            try:
+                file_content = b64decode(file_bytes).decode('latin1')
+                logger.info("File content decoded as latin1.")
+            except Exception as e2:
+                logger.error(f"Failed to decode file content: {e2}")
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": "Failed to decode file content from base64."})
+                }
+
+        query_params = req.params
         input_value = query_params.get('input')
         custom_prompt = query_params.get('prompt')
 
         if not input_value:
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "'input' parameter is missing in query string."})
+                "body": json.dumps({"error": "'input' query parameter is missing."})
             }
 
-        headers = event.get('headers', {})
+        headers = req.headers
         model_instance_name = headers.get('model_instance_name')
         if not model_instance_name:
             return {
@@ -180,22 +194,27 @@ def main(req):  # Azure Function entrypoint
             }
 
         prompt_data = get_instruction_and_prompt(input_value, custom_prompt)
+
         client = get_openai_client(model_instance_name)
 
         results = []
         for i in range(count):
-            message = [
+            logger.info(f"Invoking OpenAI client, attempt {i+1}")
+            messages = [
                 HumanMessage(content=prompt_data["instruction"]),
                 HumanMessage(content=prompt_data["prompt"] + "\n\n" + file_content)
             ]
-            response = client.invoke(message)
+            response = client.invoke(messages)
+
+            logger.info(f"OpenAI response received. Processing result.")
 
             if input_value == "/sampleforraml":
                 parsed = extract_json_from_response(response.content.strip())
                 if parsed is not None:
                     results.append(parsed)
                 else:
-                    logger.warning(f"Failed to parse JSON from response {i+1}")
+                    logger.warning(f"Failed to parse JSON from OpenAI response attempt {i+1}. Returning raw content.")
+                    results.append(response.content.strip())
             else:
                 results.append(response.content.strip())
 
@@ -213,7 +232,7 @@ def main(req):  # Azure Function entrypoint
             }
 
     except Exception as e:
-        logger.error("Unhandled exception: %s", str(e))
+        logger.exception("Unhandled exception:")
         return {
             "statusCode": 500,
             "body": json.dumps({"error": str(e)})
